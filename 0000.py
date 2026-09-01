@@ -4055,7 +4055,29 @@ async def run_all_bots():
             t.cancel()
 
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive 24/7/365!")
+
+    def log_message(self, format, *args):
+        return  # Silence access logs
+
+def start_keepalive_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"🌍 Keep-alive HTTP server running on port {port}")
+
+
 if __name__ == "__main__":
+    start_keepalive_server()
     while True:
         try:
             asyncio.run(run_all_bots())
