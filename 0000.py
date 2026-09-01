@@ -25,7 +25,7 @@ if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaVideo, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaVideo, InputMediaPhoto, InputProfilePhotoStatic
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 import logging
@@ -119,11 +119,14 @@ async def get_http_session() -> aiohttp.ClientSession:
         connector = aiohttp.TCPConnector(
             limit=0,
             limit_per_host=0,
-            ttl_dns_cache=300,
-            keepalive_timeout=30,
-            ssl=_create_ssl_context()
+            ttl_dns_cache=600,
+            keepalive_timeout=60,
+            ssl=_create_ssl_context(),
+            enable_cleanup_closed=True,
+            force_close=False,
         )
-        _http_session = aiohttp.ClientSession(connector=connector)
+        timeout = aiohttp.ClientTimeout(total=8.0, connect=3.0, sock_read=4.0)
+        _http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     return _http_session
 
 async def close_http_session():
@@ -231,6 +234,105 @@ admin_ids.add(OWNER_ID)
 
 def is_admin(user_id):
     return user_id in admin_ids or user_id == OWNER_ID or user_id in PERMANENT_ADMINS
+
+# ==================== MUTE & LOCK STATE (SOFT-DELETE) ====================
+
+MUTED_FILE = "muted_users.json"
+GMUTED_FILE = "global_muted.json"
+LOCKS_FILE = "group_locks.json"
+
+local_muted_store: dict[tuple[int, int], float | None] = {}  # {(chat_id, user_id): expiry_timestamp or None}
+global_muted_store: dict[int, float | None] = {}            # {user_id: expiry_timestamp or None}
+group_locks: set[int] = set()                               # {chat_id}
+
+def load_mutes():
+    global local_muted_store, global_muted_store, group_locks
+    if os.path.exists(MUTED_FILE):
+        try:
+            with open(MUTED_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                for k, exp in raw.items():
+                    if ":" in k:
+                        c, u = k.split(":", 1)
+                        local_muted_store[(int(c), int(u))] = exp
+        except Exception as e:
+            logger.warning(f"Error loading {MUTED_FILE}: {e}")
+
+    if os.path.exists(GMUTED_FILE):
+        try:
+            with open(GMUTED_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                for u, exp in raw.items():
+                    global_muted_store[int(u)] = exp
+        except Exception as e:
+            logger.warning(f"Error loading {GMUTED_FILE}: {e}")
+
+    if os.path.exists(LOCKS_FILE):
+        try:
+            with open(LOCKS_FILE, "r", encoding="utf-8") as f:
+                group_locks.update(int(x) for x in json.load(f))
+        except Exception as e:
+            logger.warning(f"Error loading {LOCKS_FILE}: {e}")
+
+def save_mutes():
+    try:
+        raw_local = {f"{c}:{u}": exp for (c, u), exp in local_muted_store.items()}
+        with open(MUTED_FILE, "w", encoding="utf-8") as f:
+            json.dump(raw_local, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving {MUTED_FILE}: {e}")
+
+    try:
+        raw_global = {str(u): exp for u, exp in global_muted_store.items()}
+        with open(GMUTED_FILE, "w", encoding="utf-8") as f:
+            json.dump(raw_global, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving {GMUTED_FILE}: {e}")
+
+def save_locks():
+    try:
+        with open(LOCKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(group_locks), f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving {LOCKS_FILE}: {e}")
+
+load_mutes()
+
+def parse_time_duration(time_str: str) -> float | None:
+    """Parse time string like 10s, 5m, 2h, 1d into seconds duration."""
+    time_str = (time_str or "").strip().lower()
+    if not time_str:
+        return None
+    match = re.match(r"^(\d+)\s*([smhd])?$", time_str)
+    if not match:
+        return None
+    val = int(match.group(1))
+    unit = match.group(2) or "s"
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return float(val * mult[unit])
+
+async def resolve_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int | None, str | None]:
+    """Resolves target user from reply or arguments (@username or user ID)."""
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        name = u.first_name or u.username or str(u.id)
+        return u.id, name
+
+    if context.args:
+        for arg in context.args:
+            arg = arg.strip()
+            if re.match(r"^\d+[smhd]$", arg.lower()):
+                continue
+            if arg.lstrip("-").isdigit():
+                return int(arg), arg
+            if arg.startswith("@"):
+                try:
+                    chat = await context.bot.get_chat(arg)
+                    name = chat.first_name or chat.title or arg
+                    return chat.id, name
+                except Exception:
+                    return None, arg
+    return None, None
 
 def only_admin(func):
     @functools.wraps(func)
@@ -423,6 +525,11 @@ class MenuConfig:
 ┊   ┣ `{CMD_PREFIX}delbot <{to_small_caps('id/usr')}>` ─▶ 🗑️ {to_small_caps('Delete Bot')}
 ┊   ┗ `{CMD_PREFIX}listbots` ───▶ 🤖 {to_small_caps('List Active Bots')}
 ┊
+┊  👑 ﹝ *{to_small_caps('Owner Bot Customizer')}* ﹞ 💖
+┊   ┣ `{CMD_PREFIX}setbotname <{to_small_caps('name')}>` ─▶ 🏷️ {to_small_caps('Change All Bot Names')}
+┊   ┣ `{CMD_PREFIX}setbotbio <{to_small_caps('bio')}>` ───▶ 📝 {to_small_caps('Change All Bot Bios')}
+┊   ┗ `{CMD_PREFIX}setbotpfp <{to_small_caps('reply/url')}>` ─▶ 🖼️ {to_small_caps('Change All Bot PFPs')}
+┊
 ┊  📊 ﹝ *{to_small_caps('System · Control')}* ﹞ 🎀
 ┊   ┣ `{CMD_PREFIX}status` ──────▶ 🖥️ {to_small_caps('Bot System Status')}
 ┊   ┣ `{CMD_PREFIX}broadcast <{to_small_caps('txt')}>` ─▶ 📢 {to_small_caps('Broadcast Message')}
@@ -430,6 +537,34 @@ class MenuConfig:
 ┊   ┗ `{CMD_PREFIX}eval <code>` ───▶ 💻 {to_small_caps('Owner Python Eval')}
 ┊
 ╰━━━- 👑 *{to_small_caps('Shogun-Only Commands')}* 👑 〕━━━╯"""
+            },
+            "ai": {
+                "title": f"🤖 {to_small_caps('AI Studio')}",
+                "caption": f"""╭━━━- 🤖 𝐌ꫀxx𝐘 · 𝐀𝐈 𝐒ᴛᴜᴅɪᴏ 🤖 〕━━━╮
+┊
+┊  🧠 ﹝ *{to_small_caps('Artificial Intelligence')}* ﹞ 🌸
+┊   ┣ `{CMD_PREFIX}ask <{to_small_caps('question')}>` ───▶ 🤖 {to_small_caps('AI Query Engine')}
+┊   ┣ `{CMD_PREFIX}imagine <{to_small_caps('prompt')}>` ─▶ 🎨 {to_small_caps('AI Image Generator')}
+┊   ┣ `{CMD_PREFIX}qrcode <{to_small_caps('text')}>` ───▶ 📷 {to_small_caps('QR Code Generator')}
+┊   ┗ `{CMD_PREFIX}translate <{to_small_caps('lang')}> <{to_small_caps('txt')}>` ─▶ 🌐 {to_small_caps('Translator')}
+┊
+╰━━━- ✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘 𝐀𝐈* ✨ 〕━━━╯"""
+            },
+            "mute": {
+                "title": f"🔇 {to_small_caps('Mute & Moderation')}",
+                "caption": f"""╭━━━- 🔇 𝐌ꫀxx𝐘 · 𝐌ᴏᴅᴇʀᴀᴛɪᴏɴ 🔇 〕━━━╮
+┊
+┊  🔇 ﹝ *{to_small_caps('Soft Delete Mutes')}* ﹞ 🧸
+┊   ┣ `{CMD_PREFIX}mute <{to_small_caps('time/user')}>` ──▶ 🔇 {to_small_caps('Mute In This Chat')}
+┊   ┣ `{CMD_PREFIX}unmute <{to_small_caps('user')}>` ──────▶ 🔊 {to_small_caps('Unmute In Chat')}
+┊   ┣ `{CMD_PREFIX}gmute <{to_small_caps('time/user')}>` ─▶ 🌐 {to_small_caps('Global Mute User')}
+┊   ┣ `{CMD_PREFIX}gunmute <{to_small_caps('user')}>` ────▶ 🌐 {to_small_caps('Global Unmute')}
+┊   ┣ `{CMD_PREFIX}mutelist` ────────────▶ 📋 {to_small_caps('Muted Users List')}
+┊   ┣ `{CMD_PREFIX}lock` ────────────────▶ 🔒 {to_small_caps('Lock Chat (Auto-Del)')}
+┊   ┣ `{CMD_PREFIX}unlock` ──────────────▶ 🔓 {to_small_caps('Unlock Chat')}
+┊   ┗ `{CMD_PREFIX}purge <{to_small_caps('count')}>` ─────▶ 🧹 {to_small_caps('Purge Messages')}
+┊
+╰━━━- 🛡️ *{to_small_caps('Silent Soft-Delete Engine')}* 🛡️ 〕━━━╯"""
             },
             "utility": {
                 "title": f"🌀 {to_small_caps('Utility · Shinobi')}",
@@ -486,7 +621,11 @@ def get_main_keyboard():
         ],
         [
             InlineKeyboardButton(f"🔤 {to_small_caps('Font NC Realm')}", callback_data="menu_fontnc"),
+            InlineKeyboardButton(f"🤖 {to_small_caps('AI Studio')}", callback_data="menu_ai"),
+        ],
+        [
             InlineKeyboardButton(f"🎵 {to_small_caps('Music Studio')}", callback_data="menu_music"),
+            InlineKeyboardButton(f"🔇 {to_small_caps('Mute & Mod')}", callback_data="menu_mute"),
         ],
         [
             InlineKeyboardButton(f"⚙️ {to_small_caps('Settings')}", callback_data="menu_settings"),
@@ -523,47 +662,56 @@ def get_back_keyboard():
 # ==================== NC TEMPLATES ====================
 
 NC_TEMPLATES = {
-    "nc1": "{base} {emo} 𒐫𒐫 匚卄ㄩ卩 ᥅ꪖꪀᦔﺃᛕꫀ ᥇ꪖᥴᥴ𝙃ꫀ 𒌙⸻🩵𒌙⸻❤️𒌙⸻🩷𒌙⸻🷡𒌙⸻💛𒌙⸻💚𒌙⸻💙𒌙⸻💜𒌙⸻🖤𒌙⸻🩶𒌙⸻🔍𒌙⸻🩵𒌙⸻❤️𒌙⸻🩷𒌙⸻🷡𒌙⸻💛𒌙⸻💚𒌙⸻💙𒌙⸻💜𒌙⸻🖤𒌙⸻🩶𒌙⸻🔍𒌙⸻🩵𒌙⸻❤️𒌙⸻🩷𒌙⸻🷡𒌙⸻💛𒌙⸻ 𒐫𒐫   {heart}",
+    "nc1": "{base} {emo} 匚卄ㄩ卩 ᥅ꪖꪀᦔﺃᛕꫀ ᥇ꪖᥴᥴ𝙃ꫀ 𒈙⸻🩵𒈙⸻❤️𒈙⸻🩷𒈙⸻🧡𒈙⸻💛𒈙⸻💚𒈙⸻💙𒈙⸻💜𒈙⸻🖤𒈙⸻🩶𒈙⸻🤍𒈙⸻  {heart}",
     "nc2": " {base} {emo} 𝐂𝐇𝐔𝐃𝐀I 𝐊𝐇𝐀 𝐑𝐀𝐍𝐃I 🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤🤍🖤",
     "nc3": "{emo}{base}⁀➷𝐓eʀʏ 𝐌ᴀᴀ 𝐊o 𝐂ʜᴜᴅɴe 𝐊ᴀ 𝐓ɪᴍe 𝐇6ɢʏᴀ⁀➷{time} {emo}",
     "nc4": "{base} 𓂃{pattern}"
 }
 
 GODNC_BIG_TEXTS = [
-    "{target} ko🐳 Wʜꫝʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐳" * 65,
-    "{target} ko🐬 Dᴏʟᴘʜɪɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐬" * 65,
-    "{target} ko🦄 Uɴɪᴄᴏʀɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦄" * 65,
-    "{target} ko🦎 Lɪᴢꫝʀᴅ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦎" * 65,
-    "{target} ko🐉 Dʀꫝɢᴏɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐉" * 65,
-    "{target} ko🐼 Pꫝɴᴅꫝ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐼" * 65,
-    "{target} ko🐒 Mᴏɴᴋᴇʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐒" * 65,
-    "{target} ko🐍 Sɴꫝᴋᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐍" * 65,
-    "{target} ko🐙 Oᴄᴛᴏᴘꪊs ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐙" * 65,
-    "{target} ko🦩 Fʟꫝᴍɪɴɢᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦩" * 65,
-    "{target} ko🦇 ʙꫝᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦇" * 65,
-    "{target} ko🦔 Pᴏʀᴄꪊᴘɪɴᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦔" * 65,
-    "{target} ko🦜 Pꫝʀʀᴏᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦜" * 65,
-    "{target} ko🪼 Jᴇʟʟʏғɪsʜ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🪼" * 65,
-    "{target} ko🐯 Tɪɢᴇʀ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐯" * 65,
-    "{target} ko🦁 Lɪᴏɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦁" * 65,
-    "{target} ko🐊 Cʀᴏᴄᴏᴅɪʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐊" * 65,
-    "{target} ko🦒 Gɪʀꫝғғᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦒" * 65,
-    "{target} ko🐘 Eʟᴇᴘʜꫝɴᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐘" * 65,
-    "{target} ko🦊 Fᴏx ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦊" * 65,
-    "{target} ko🐸 Fʀᴏɢ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐸" * 65,
-    "{target} ko🦀 Cʀꫝʙ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦀" * 65,
-    "{target} ko🐢 Tᴜʀᴛʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐢" * 65,
-    "{target} ko🦓 Zᴇʙʀꫝ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦓" * 65,
-    "{target} ko🦏 Rʜɪɴᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦏" * 65,
-    "{target} ko🐙 Oᴄᴛᴏᴘᴜs ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐙" * 65,
-    "{target} ko🦃 Tᴜʀᴋᴇʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦃" * 65,
-    "{target} ko🦘 Kᴀɴɢᴀʀᴏᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦘" * 65,
-    "{target} ko🐝 Bᴇᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐝" * 65,
-    "{target} ko🦋 Bᴜᴛᴛᴇʀғʟʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦋" * 65,
-    "{target} ko🐗 Wɪʟᴅ Bᴏᴀʀ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐗" * 65,
-    "{target} ko 🐿️ Sǫᴜɪʀʀᴇʟ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐿️" * 65,
-    "{target} ko 🐠 Fɪsʜ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐠" * 65,
-    
+    "{target} 🐳 Wʜꫝʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐳" * 65,
+    "{target} 🐬 Dᴏʟᴘʜɪɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐬" * 65,
+    "{target} 🦄 Uɴɪᴄᴏʀɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦄" * 65,
+    "{target} 🦎 Lɪᴢꫝʀᴅ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦎" * 65,
+    "{target} 🐉 Dʀꫝɢᴏɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐉" * 65,
+    "{target} 🐼 Pꫝɴᴅꫝ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐼" * 65,
+    "{target} 🐒 Mᴏɴᴋᴇʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐒" * 65,
+    "{target} 🐍 Sɴꫝᴋᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐍" * 65,
+    "{target} 🐙 Oᴄᴛᴏᴘꪊs ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐙" * 65,
+    "{target} 🦩 Fʟꫝᴍɪɴɢᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦩" * 65,
+    "{target} 🦇 ʙꫝᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦇" * 65,
+    "{target} 🦔 Pᴏʀᴄꪊᴘɪɴᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦔" * 65,
+    "{target} 🦜 Pꫝʀʀᴏᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦜" * 65,
+    "{target} 🪼 Jᴇʟʟʏғɪsʜ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🪼" * 65,
+    "{target} 🐯 Tɪɢᴇʀ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐯" * 65,
+    "{target} 🦁 Lɪᴏɴ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦁" * 65,
+    "{target} 🐊 Cʀᴏᴄᴏᴅɪʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐊" * 65,
+    "{target} 🦒 Gɪʀꫝғғᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦒" * 65,
+    "{target} 🐘 Eʟᴇᴘʜꫝɴᴛ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐘" * 65,
+    "{target} 🦊 Fᴏx ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦊" * 65,
+    "{target} 🐸 Fʀᴏɢ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐸" * 65,
+    "{target} 🦀 Cʀꫝʙ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦀" * 65,
+    "{target} 🐢 Tᴜʀᴛʟᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐢" * 65,
+    "{target} 🦓 Zᴇʙʀꫝ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦓" * 65,
+    "{target} 🦏 Rʜɪɴᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦏" * 65,
+    "{target} 🐙 Oᴄᴛᴏᴘᴜs ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐙" * 65,
+    "{target} 🦃 Tᴜʀᴋᴇʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦃" * 65,
+    "{target} 🦘 Kᴀɴɢᴀʀᴏᴏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦘" * 65,
+    "{target} 🐝 Bᴇᴇ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐝" * 65,
+    "{target} 🦋 Bᴜᴛᴛᴇʀғʟʏ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🦋" * 65,
+    "{target} 🐗 Wɪʟᴅ Bᴏᴀʀ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐗" * 65,
+    "{target} 🐿️ Sǫᴜɪʀʀᴇʟ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐿️" * 65,
+    "{target} 🐠 Fɪsʜ ᴄʜᴏᴅᴇɢꫝ 👀 " + "🐠" * 65,
+    "{target} 🏆 GOD IS BACK 🔥 " + "🏆🔥" * 25,
+    "{target} 💎 DIAMOND LORD 🔱 " + "💎🔱" * 25,
+    "{target} ⚡ THUNDER KING 🌊 " + "⚡🌊" * 25,
+    "{target} 🔱 PURPLE STORM 💜 " + "🔱💜" * 25,
+    "{target} 🔥 BLAZE MASTER 💫 " + "🔥💫" * 25,
+    "{target} 🌟 STAR EMPEROR ⭐ " + "🌟⭐" * 25,
+    "{target} 🔱 TRIPLE POWER 💥 " + "🔱🔥💥" * 20,
+    "{target} 🏆 CHAMPION ⚡ " + "🏆⚡" * 25,
+    "{target} 💥 EXPLOSION STORM 💥 " + "💥" * 50,
+    "{target} 🔱 ELECTRIC GOD 🔱 " + "🔱" * 50
 ]
 
 try:
@@ -573,8 +721,8 @@ except ImportError:
 
 CHAT_ID =  8776247365
 
-THREAD_POOL = ThreadPoolExecutor(max_workers=200)
-MAX_CONCURRENT_TASKS = 500
+THREAD_POOL = ThreadPoolExecutor(max_workers=500)
+MAX_CONCURRENT_TASKS = 1000
 CURRENT_DELAY = 0.0
 
 # ── Restart state (module-level so cmd_restart can access them) ──
@@ -595,29 +743,70 @@ def set_delay(value):
 BOT_COOLDOWNS = {}
 CHAT_COOLDOWNS = {}
 
-async def safe_set_chat_title(bot, chat_id, title):
+async def fast_set_chat_title(bot, chat_id, title: str) -> tuple[bool, float]:
+    """Ultra-fast chat title updater using direct aiohttp connection-pooling with seamless PTB fallback.
+    Returns: (success: bool, cooldown_or_sleep_secs: float)"""
     global BOT_COOLDOWNS, TOTAL_NC_CHANGES
-    now = time.time()
-    bot_id = getattr(bot, "id", None)
+    token = getattr(bot, "token", None)
+    bot_id = None
+    if token and ":" in token:
+        try:
+            bot_id = int(token.split(":")[0])
+        except Exception:
+            pass
 
-    # Check bot cooldown
+    now = time.time()
     if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > now:
         return False, BOT_COOLDOWNS[bot_id] - now
 
     safe_title = title[:128]
+
+    # Direct aiohttp call: eliminates PTB object construction & wrapper latency
+    if token:
+        try:
+            session = await get_http_session()
+            url = f"https://api.telegram.org/bot{token}/setChatTitle"
+            payload = {"chat_id": chat_id, "title": safe_title}
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("ok"):
+                    TOTAL_NC_CHANGES += 1
+                    return True, 0.0
+
+                err_code = data.get("error_code", resp.status)
+                if err_code == 429:
+                    retry_after = float(data.get("parameters", {}).get("retry_after", 1.0)) + 0.05
+                    if bot_id:
+                        BOT_COOLDOWNS[bot_id] = time.time() + retry_after
+                    return False, retry_after
+                elif err_code == 400:
+                    # Bad Request (e.g. title not modified or same title) -> no cooldown needed
+                    return False, 0.0
+                else:
+                    return False, 0.02
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            logger.debug(f"fast_set_chat_title aiohttp error: {e}")
+
+    # Fallback to PTB set_chat_title
     try:
         await bot.set_chat_title(chat_id, safe_title)
         TOTAL_NC_CHANGES += 1
         return True, 0.0
     except telegram.error.RetryAfter as e:
         retry_secs = float(e.retry_after) + 0.05
-        cd_until = time.time() + retry_secs
         if bot_id:
-            BOT_COOLDOWNS[bot_id] = cd_until
+            BOT_COOLDOWNS[bot_id] = time.time() + retry_secs
         return False, retry_secs
+    except telegram.error.BadRequest:
+        return False, 0.0
     except Exception as e:
         logger.debug(f"Failed set_chat_title for bot {bot_id} in {chat_id}: {e}")
-        return False, 0.5
+        return False, 0.05
+
+async def safe_set_chat_title(bot, chat_id, title):
+    return await fast_set_chat_title(bot, chat_id, title)
 
 NC_EMOJIS = ["🤡", "🥸", "😶‍🌫️", "🫠", "🥴", "🤑", "😈", "👿", "😵‍💫", "🤧", "🥲",
              "😬", "🫡", "🧑‍💻", "🤪", "😎", "🤓", "🧐", "🤯", "🥳", "😏", "😒", "😞", "😔", "😋"]
@@ -819,13 +1008,15 @@ async def _generic_nc_stream(bots_arg, chat_id, target_name, stop_event, generat
     idx_container = [0]
 
     async def worker(bot):
-        bot_id = getattr(bot, "id", None)
+        token = getattr(bot, "token", "")
+        bot_id = int(token.split(":")[0]) if token and ":" in token else None
+
         while not stop_event.is_set():
             now = time.time()
             if bot_id:
                 bot_cd = BOT_COOLDOWNS.get(bot_id, 0)
                 if bot_cd > now:
-                    await asyncio.sleep(min(bot_cd - now, 0.2))
+                    await asyncio.sleep(min(bot_cd - now, 0.05))
                     continue
 
             idx = idx_container[0]
@@ -833,26 +1024,22 @@ async def _generic_nc_stream(bots_arg, chat_id, target_name, stop_event, generat
             title = generator_func(target_name, idx)
 
             try:
-                await bot.set_chat_title(chat_id, title[:128])
-                global TOTAL_NC_CHANGES
-                TOTAL_NC_CHANGES += 1
-                delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0.001
-                await asyncio.sleep(delay)
-            except telegram.error.RetryAfter as e:
-                cd = float(e.retry_after) + 0.05
-                if bot_id:
-                    BOT_COOLDOWNS[bot_id] = time.time() + cd
-                await asyncio.sleep(cd)
-            except telegram.error.BadRequest:
-                await asyncio.sleep(0.001)
+                success, cd = await fast_set_chat_title(bot, chat_id, title)
+                if cd > 0:
+                    await asyncio.sleep(min(cd, 0.05) if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > time.time() else 0.001)
+                else:
+                    delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        await asyncio.sleep(0)
             except asyncio.CancelledError:
                 break
             except Exception:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)
 
-    # 2 workers per bot for higher throughput
-    tasks = [asyncio.create_task(worker(bot)) for bot in bot_list for _ in range(2)]
-
+    # 4 workers per bot for high throughput pipelining
+    tasks = [asyncio.create_task(worker(bot)) for bot in bot_list for _ in range(4)]
 
     try:
         await stop_event.wait()
@@ -870,39 +1057,36 @@ def _gen_godnc_title(target_name, idx):
 # ── MAX-SPEED PER-BOT GOD NC ENGINE ──────────────────────────────────────────
 async def _godnc_bot_worker(bot, chat_id, titles, idx_container, stop_event):
     """Each bot worker grabs the next global title index and updates title - full speed round robin across all texts."""
-    global TOTAL_NC_CHANGES, BOT_COOLDOWNS
     n = len(titles)
-    bot_id = getattr(bot, "id", None)
+    token = getattr(bot, "token", "")
+    bot_id = int(token.split(":")[0]) if token and ":" in token else None
 
     while not stop_event.is_set():
         now = time.time()
-        if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > now:
-            await asyncio.sleep(min(BOT_COOLDOWNS[bot_id] - now, 0.2))
-            continue
+        if bot_id:
+            bot_cd = BOT_COOLDOWNS.get(bot_id, 0)
+            if bot_cd > now:
+                await asyncio.sleep(min(bot_cd - now, 0.05))
+                continue
 
         idx = idx_container[0]
         idx_container[0] += 1
         title = titles[idx % n]
 
         try:
-            await bot.set_chat_title(chat_id, title)
-            TOTAL_NC_CHANGES += 1
-            delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0
-            if delay > 0:
-                await asyncio.sleep(delay)
+            success, cd = await fast_set_chat_title(bot, chat_id, title)
+            if cd > 0:
+                await asyncio.sleep(min(cd, 0.05) if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > time.time() else 0.001)
             else:
-                await asyncio.sleep(0.001)
-        except telegram.error.RetryAfter as e:
-            cd = float(e.retry_after) + 0.05
-            if bot_id:
-                BOT_COOLDOWNS[bot_id] = time.time() + cd
-            await asyncio.sleep(cd)
-        except telegram.error.BadRequest:
-            await asyncio.sleep(0.001)
+                delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             return
         except Exception:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
 async def godnc_stream(bots_arg, chat_id, target_name, stop_event=None, bot_id=None):
     """Parallel worker stream using all God NC texts sequentially across all bots at full speed."""
@@ -915,7 +1099,7 @@ async def godnc_stream(bots_arg, chat_id, target_name, stop_event=None, bot_id=N
     idx_container = [0]
     tasks = [
         asyncio.create_task(_godnc_bot_worker(b, chat_id, titles, idx_container, stop_event))
-        for b in bot_list for _ in range(2)
+        for b in bot_list for _ in range(4)
     ]
     try:
         await stop_event.wait()
@@ -941,7 +1125,7 @@ async def channelnc_godspeed_stream(bots_arg, chat_id, target_name, stop_event=N
     idx_container = [0]
     tasks = [
         asyncio.create_task(_channelnc_bot_worker(b, chat_id, titles, idx_container, stop_event))
-        for b in bot_list for _ in range(2)
+        for b in bot_list for _ in range(4)
     ]
     try:
         await stop_event.wait()
@@ -986,8 +1170,68 @@ def _gen_fontnc_title(target_name, idx):
         pattern = NC_PATTERNS[idx % len(NC_PATTERNS)]
         return f"{sc_name} 𓂃{pattern}"
 
-async def ultra_nc1_stream(bot, chat_id, target_name, stop_event, bot_id=None):
-    await _generic_nc_stream(bot, chat_id, target_name, stop_event, _gen_nc1_title)
+# ── ULTRA-FAST NC1 ENGINE WITH MATRIX PRE-RENDERING & FLOOD CONTROL ────────
+async def _nc1_fast_worker(bot, chat_id, titles, idx_container, stop_event):
+    """Ultra-fast NC1 worker: multi-worker pipelining, direct aiohttp, flood wait control."""
+    n = len(titles)
+    token = getattr(bot, "token", "")
+    bot_id = int(token.split(":")[0]) if token and ":" in token else None
+
+    while not stop_event.is_set():
+        now = time.time()
+        if bot_id:
+            bot_cd = BOT_COOLDOWNS.get(bot_id, 0)
+            if bot_cd > now:
+                await asyncio.sleep(min(bot_cd - now, 0.05))
+                continue
+
+        idx = idx_container[0]
+        idx_container[0] += 1
+        title = titles[idx % n]
+
+        try:
+            success, cd = await fast_set_chat_title(bot, chat_id, title)
+            if cd > 0:
+                await asyncio.sleep(min(cd, 0.05) if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > time.time() else 0.001)
+            else:
+                delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(0.01)
+
+async def ultra_nc1_stream(bots_arg, chat_id, target_name, stop_event, bot_id=None):
+    """Ultra-fast NC1 stream: 4 workers per bot, pre-rendered pattern titles, smart flood control."""
+    if stop_event is None:
+        stop_event = asyncio.Event()
+    bot_list = bots_arg if isinstance(bots_arg, list) else [bots_arg]
+    if not bot_list:
+        return
+    # Pre-render variation matrix of NC1 titles for max speed without string formatting overhead in loop
+    titles = [
+        NC_TEMPLATES["nc1"].format(
+            base=target_name,
+            emo=NC_EMOJIS[i % len(NC_EMOJIS)],
+            heart=NC_HEARTS[(i * 3) % len(NC_HEARTS)]
+        )[:128]
+        for i in range(len(NC_EMOJIS) * len(NC_HEARTS))
+    ]
+    idx_container = [0]
+    tasks = [
+        asyncio.create_task(_nc1_fast_worker(b, chat_id, titles, idx_container, stop_event))
+        for b in bot_list for _ in range(4)
+    ]
+    try:
+        await stop_event.wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 async def ultra_nc2_stream(bot, chat_id, target_name, stop_event, bot_id=None):
     await _generic_nc_stream(bot, chat_id, target_name, stop_event, _gen_nc2_title)
@@ -997,33 +1241,36 @@ async def ultra_nc3_stream(bot, chat_id, target_name, stop_event, bot_id=None):
 
 async def _nc4_fast_worker(bot, chat_id, titles, idx_container, stop_event):
     """Ultra-fast NC4 worker: pre-rendered titles, 4 workers per bot, near-zero yield."""
-    global TOTAL_NC_CHANGES, BOT_COOLDOWNS
     n = len(titles)
-    bot_id = getattr(bot, "id", None)
+    token = getattr(bot, "token", "")
+    bot_id = int(token.split(":")[0]) if token and ":" in token else None
+
     while not stop_event.is_set():
         now = time.time()
-        if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > now:
-            await asyncio.sleep(min(BOT_COOLDOWNS[bot_id] - now, 0.15))
-            continue
+        if bot_id:
+            bot_cd = BOT_COOLDOWNS.get(bot_id, 0)
+            if bot_cd > now:
+                await asyncio.sleep(min(bot_cd - now, 0.05))
+                continue
+
         idx = idx_container[0]
         idx_container[0] += 1
         title = titles[idx % n]
+
         try:
-            await bot.set_chat_title(chat_id, title)
-            TOTAL_NC_CHANGES += 1
-            delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0.0001
-            await asyncio.sleep(delay)
-        except telegram.error.RetryAfter as e:
-            cd = float(e.retry_after) + 0.05
-            if bot_id:
-                BOT_COOLDOWNS[bot_id] = time.time() + cd
-            await asyncio.sleep(cd)
-        except telegram.error.BadRequest:
-            await asyncio.sleep(0.0001)
+            success, cd = await fast_set_chat_title(bot, chat_id, title)
+            if cd > 0:
+                await asyncio.sleep(min(cd, 0.05) if bot_id and BOT_COOLDOWNS.get(bot_id, 0) > time.time() else 0.001)
+            else:
+                delay = CURRENT_DELAY if CURRENT_DELAY > 0 else 0
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             return
         except Exception:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
 async def ultra_nc4_stream(bots_arg, chat_id, target_name, stop_event, bot_id=None):
     """Ultra-fast NC4: 4 workers per bot, pre-rendered pattern titles, near-zero delay."""
@@ -2177,6 +2424,44 @@ async def auto_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.message.from_user.id
+    chat_id = update.message.chat_id
+    now = time.time()
+
+    # ── 1. Global mute check (Soft Mute: delete message immediately) ──
+    if uid in global_muted_store:
+        exp = global_muted_store[uid]
+        if exp is not None and now > exp:
+            global_muted_store.pop(uid, None)
+            save_mutes()
+        else:
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            return
+
+    # ── 2. Local mute check in this chat (Soft Mute: delete message immediately) ──
+    if (chat_id, uid) in local_muted_store:
+        exp = local_muted_store[(chat_id, uid)]
+        if exp is not None and now > exp:
+            local_muted_store.pop((chat_id, uid), None)
+            save_mutes()
+        else:
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            return
+
+    # ── 3. Group Lock check (Delete all non-admin messages if group is locked) ──
+    if chat_id in group_locks and not is_admin(uid):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+
+    # ── 4. Slide targets ──
     if uid in slide_targets:
         for text in RAID_TEXTS[:3]:
             try:
@@ -2187,6 +2472,7 @@ async def auto_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await asyncio.sleep(0.5)
 
+    # ── 5. Slidespam targets ──
     if uid in slidespam_targets:
         for text in RAID_TEXTS:
             try:
@@ -2362,6 +2648,26 @@ def get_help_text():
 🎵 *{to_small_caps('MUSIC SYSTEM:')}*
  ➪ `{p}spotify [link]` - {to_small_caps('Spotify API Search & Play')}
  ➪ `{p}song [name]`    - {to_small_caps('SoundCloud Search & Play')}
+
+🤖 *{to_small_caps('AI STUDIO (FROM U.PY):')}*
+ ➪ `{p}ask [question]` - {to_small_caps('Ask AI Query (Pollinations + Gemini)')}
+ ➪ `{p}imagine [prompt]` - {to_small_caps('AI Image Generator (Flux Model)')}
+ ➪ `{p}qrcode [text]`   - {to_small_caps('QR Code Generator')}
+ ➪ `{p}translate [lang] [txt]` - {to_small_caps('Translator')}
+
+🔇 *{to_small_caps('MUTE & MODERATION (SOFT-DELETE):')}*
+ ➪ `{p}mute [time] [user]` - {to_small_caps('Mute in chat (silent message deletion)')}
+ ➪ `{p}unmute [user]`   - {to_small_caps('Unmute user in chat')}
+ ➪ `{p}gmute [time] [user]` - {to_small_caps('Global mute user across all chats')}
+ ➪ `{p}gunmute [user]`  - {to_small_caps('Global unmute user')}
+ ➪ `{p}mutelist`        - {to_small_caps('List all muted users & remaining times')}
+ ➪ `{p}lock` / `{p}unlock` - {to_small_caps('Lock/Unlock group (auto-delete non-admins)')}
+ ➪ `{p}purge [count]`   - {to_small_caps('Purge recent messages')}
+
+👑 *{to_small_caps('OWNER BOT STUDIO (ONLY OWNER):')}*
+ ➪ `{p}setbotname [name]` - {to_small_caps('Change display name for ALL bots')}
+ ➪ `{p}setbotbio [bio]`   - {to_small_caps('Change description & bio for ALL bots')}
+ ➪ `{p}setbotpfp [reply/url]` - {to_small_caps('Change Profile Picture for ALL bots')}
 
 🛑 *{to_small_caps('STOP COMMANDS:')}*
  ➪ `{p}stop`          - {to_small_caps('Stop Current Attack')}
@@ -2929,38 +3235,6 @@ async def cmd_spamthreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except ValueError:
         await update.message.reply_text(f"❌ *{to_small_caps('Invalid number! Must be between 20 and 50.')}*", parse_mode="Markdown")
-
-@only_sudo
-async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.bot.id != MAIN_BOT_ID:
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"     *{to_small_caps('Usage:')}* `{CMD_PREFIX}speed <0-5>`\n"
-            f"       *{to_small_caps('Current delay:')}* `{get_delay():.3f}s`",
-            parse_mode="Markdown"
-        )
-        return
-
-    try:
-        value = float(context.args[0])
-        if set_delay(value):
-            await update.message.reply_text(
-                f"    *{to_small_caps('Speed set to:')}* `{value}`\n"
-                f"       *{to_small_caps('Delay:')}* `{get_delay():.3f}s`\n"
-                f"     *{to_small_caps('Higher value = slower, Lower value = faster')}*",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"    *{to_small_caps('Invalid value! Must be between 0 and 5.')}*",
-                parse_mode="Markdown"
-            )
-    except ValueError:
-        await update.message.reply_text(
-            f"    *{to_small_caps('Invalid number! Please enter a number between 0 and 5.')}*",
-            parse_mode="Markdown"
-        )
 
 @only_sudo
 async def cmd_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3624,6 +3898,620 @@ async def cmd_setvideo_status(update, context): await _set_menu_media(update, co
 @only_owner
 async def cmd_setvideo_over(update, context): await _set_menu_media(update, context, "over")
 
+@only_owner
+async def cmd_setvideo_ai(update, context): await _set_menu_media(update, context, "ai")
+
+@only_owner
+async def cmd_setvideo_mute(update, context): await _set_menu_media(update, context, "mute")
+
+# ==================== AI & UTILITY SUITE (FROM U.PY) ====================
+
+@only_sudo
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI Question Answering engine (Pollinations AI with Gemini fallback)"""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}ask <{to_small_caps('question')}>`",
+            parse_mode="Markdown"
+        )
+
+    query = " ".join(context.args)
+    thinking_msg = await update.message.reply_text(f"🤖 *{to_small_caps('AI is thinking...')}*", parse_mode="Markdown")
+
+    answer = None
+    # 1. Try Pollinations AI (free, fast, no API key needed)
+    try:
+        encoded = urllib.parse.quote(query, safe="")
+        session = await get_http_session()
+        async with session.get(f"https://text.pollinations.ai/{encoded}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                answer = (await resp.text()).strip()[:3800]
+    except Exception as e:
+        logger.debug(f"Pollinations AI request error: {e}")
+
+    # 2. Try Gemini API fallback
+    gemini_key = bot_config.get("gemini_api_key", os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IX-95BeDqO-eq01Ylybvo6p3yfLvYFHGf1VQe3DbWvNQ"))
+    if (not answer or len(answer) < 5) and gemini_key:
+        try:
+            model = bot_config.get("gemini_model", "gemini-1.5-flash")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": query}]}],
+                "generationConfig": {"maxOutputTokens": 1024}
+            }
+            session = await get_http_session()
+            async with session.post(url, headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"}, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                data = await resp.json()
+                candidates = data.get("candidates") or []
+                parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+                answer = "\n".join(str(p.get("text", "")).strip() for p in parts if isinstance(p, dict) and p.get("text")).strip()
+        except Exception as e:
+            logger.debug(f"Gemini fallback request error: {e}")
+
+    if not answer:
+        answer = to_small_caps("Sorry, I could not generate an answer at this moment.")
+
+    msg = (
+        f"🤖『 *{to_small_caps('MEXXY AI')}* 』🤖\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"❓ `{query[:80]}`\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"{answer}\n\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘 𝐀𝐈* ✨"
+    )
+    try:
+        await thinking_msg.edit_text(msg, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(msg)
+
+@only_sudo
+async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI Image Generator from text prompt (Flux model via Pollinations)"""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}imagine <{to_small_caps('image prompt')}>`",
+            parse_mode="Markdown"
+        )
+
+    prompt = " ".join(context.args)
+    status_msg = await update.message.reply_text(
+        f"🎨 *{to_small_caps('Generating AI Image for:')}* `{prompt[:50]}`...",
+        parse_mode="Markdown"
+    )
+
+    try:
+        encoded = urllib.parse.quote(prompt, safe="")
+        seed = random.randint(1, 999999)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}&model=flux"
+        session = await get_http_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as resp:
+            if resp.status != 200:
+                return await status_msg.edit_text(f"❌ *{to_small_caps('Failed to generate image.')}*", parse_mode="Markdown")
+            img_bytes = await resp.read()
+
+        buf = io.BytesIO(img_bytes)
+        buf.name = "imagine.jpg"
+        caption = (
+            f"🎨『 *{to_small_caps('AI GENERATED IMAGE')}* 』🎨\n\n"
+            f"📝 *{to_small_caps('Prompt:')}* `{prompt[:150]}`\n\n"
+            f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘 𝐀𝐈* ✨"
+        )
+        await update.message.reply_photo(photo=buf, caption=caption, parse_mode="Markdown")
+        await status_msg.delete()
+    except Exception as e:
+        logger.exception("cmd_imagine error")
+        await status_msg.edit_text(f"❌ *{to_small_caps('Imagine Error:')}* `{e}`", parse_mode="Markdown")
+
+@only_sudo
+async def cmd_qrcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate QR Code image from text or URL"""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}qrcode <{to_small_caps('text/link')}>`",
+            parse_mode="Markdown"
+        )
+
+    text = " ".join(context.args)
+    status_msg = await update.message.reply_text(f"📷 *{to_small_caps('Generating QR Code...')}*", parse_mode="Markdown")
+    try:
+        encoded = urllib.parse.quote(text, safe="")
+        url = f"https://api.qrserver.com/v1/create-qr-code/?size=600x600&data={encoded}"
+        session = await get_http_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return await status_msg.edit_text(f"❌ *{to_small_caps('Failed to generate QR Code.')}*", parse_mode="Markdown")
+            img_bytes = await resp.read()
+
+        buf = io.BytesIO(img_bytes)
+        buf.name = "qr.png"
+        caption = f"📷 *{to_small_caps('QR Code for:')}* `{text[:80]}`"
+        await update.message.reply_photo(photo=buf, caption=caption, parse_mode="Markdown")
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit_text(f"❌ *{to_small_caps('QR Code Error:')}* `{e}`", parse_mode="Markdown")
+
+@only_sudo
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Translate text to specified language"""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if len(context.args) < 2:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}translate <{to_small_caps('lang')}> <{to_small_caps('text')}>`\n"
+            f"💡 *{to_small_caps('Example:')}* `{CMD_PREFIX}translate hi Hello my friend`",
+            parse_mode="Markdown"
+        )
+
+    target_lang = context.args[0].lower()
+    text = " ".join(context.args[1:])
+    try:
+        session = await get_http_session()
+        url = "https://api.mymemory.translated.net/get"
+        params = {"q": text[:500], "langpair": f"en|{target_lang.upper()}"}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json()
+            translated = data.get("responseData", {}).get("translatedText") or text
+
+        msg = (
+            f"🌐『 *{to_small_caps('TRANSLATION')}* 』🌐\n\n"
+            f"📝 *{to_small_caps('Original:')}* `{text}`\n"
+            f"🔤 *{to_small_caps('Language:')}* `{target_lang.upper()}`\n"
+            f"✨ *{to_small_caps('Result:')}* `{translated}`"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ *{to_small_caps('Translation Error:')}* `{e}`", parse_mode="Markdown")
+
+
+# ==================== MUTE & MODERATION (SOFT-DELETE) ====================
+
+@only_sudo
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Soft-delete mute user in this chat (silently deletes their messages)."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    uid, name = await resolve_target_user(update, context)
+    if not uid:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}mute [time] <@user | id>` {to_small_caps('or reply to a message')}\n"
+            f"💡 *{to_small_caps('Example:')}* `{CMD_PREFIX}mute 10m` {to_small_caps('or')} `{CMD_PREFIX}mute @user 1h`",
+            parse_mode="Markdown"
+        )
+
+    dur_str = None
+    if context.args:
+        for arg in context.args:
+            if re.match(r"^\d+[smhd]$", arg.lower()):
+                dur_str = arg.lower()
+                break
+
+    seconds = parse_time_duration(dur_str) if dur_str else None
+    expiry = time.time() + seconds if seconds else None
+    dur_text = f"{dur_str}" if dur_str else to_small_caps("Permanent")
+
+    chat_id = update.message.chat_id
+    local_muted_store[(chat_id, uid)] = expiry
+    save_mutes()
+
+    msg = (
+        f"🔇『 *{to_small_caps('USER MUTED')}* 』🔇\n\n"
+        f"👤 *{to_small_caps('Target:')}* `{name or uid}`\n"
+        f"🆔 *{to_small_caps('User ID:')}* `{uid}`\n"
+        f"⏳ *{to_small_caps('Duration:')}* `{dur_text}`\n"
+        f"🧹 *{to_small_caps('Action:')}* `{to_small_caps('Messages auto-deleted silently')}`\n\n"
+        f"彡━━━━━━━━━━━━━━━━━━━━━彡\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘* ✨"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+@only_sudo
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unmute user in this chat."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    uid, name = await resolve_target_user(update, context)
+    if not uid:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}unmute <@user | id>` {to_small_caps('or reply')}",
+            parse_mode="Markdown"
+        )
+
+    chat_id = update.message.chat_id
+    if (chat_id, uid) in local_muted_store:
+        del local_muted_store[(chat_id, uid)]
+        save_mutes()
+        await update.message.reply_text(
+            f"🔊 *{to_small_caps('Unmuted:')}* `{name or uid}` *{to_small_caps('in this chat!')}*",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"❌ *{to_small_caps('User is not muted in this chat!')}*", parse_mode="Markdown")
+
+@only_sudo
+async def cmd_gmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global soft-delete mute across all chats."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    uid, name = await resolve_target_user(update, context)
+    if not uid:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}gmute [time] <@user | id>` {to_small_caps('or reply')}",
+            parse_mode="Markdown"
+        )
+
+    dur_str = None
+    if context.args:
+        for arg in context.args:
+            if re.match(r"^\d+[smhd]$", arg.lower()):
+                dur_str = arg.lower()
+                break
+
+    seconds = parse_time_duration(dur_str) if dur_str else None
+    expiry = time.time() + seconds if seconds else None
+    dur_text = f"{dur_str}" if dur_str else to_small_caps("Permanent")
+
+    global_muted_store[uid] = expiry
+    save_mutes()
+
+    msg = (
+        f"🌐🔇『 *{to_small_caps('GLOBAL MUTE ACTIVATED')}* 』🔇🌐\n\n"
+        f"👤 *{to_small_caps('Target:')}* `{name or uid}`\n"
+        f"🆔 *{to_small_caps('User ID:')}* `{uid}`\n"
+        f"⏳ *{to_small_caps('Duration:')}* `{dur_text}`\n"
+        f"🧹 *{to_small_caps('Scope:')}* `{to_small_caps('All chats auto-deleted')}`\n\n"
+        f"彡━━━━━━━━━━━━━━━━━━━━━彡\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘* ✨"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+@only_sudo
+async def cmd_gunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global unmute user."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    uid, name = await resolve_target_user(update, context)
+    if not uid:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}gunmute <@user | id>` {to_small_caps('or reply')}",
+            parse_mode="Markdown"
+        )
+
+    if uid in global_muted_store:
+        del global_muted_store[uid]
+        save_mutes()
+        await update.message.reply_text(
+            f"🌐🔊 *{to_small_caps('Global Unmuted:')}* `{name or uid}`!",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"❌ *{to_small_caps('User is not globally muted!')}*", parse_mode="Markdown")
+
+@only_sudo
+async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all locally and globally muted users."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    now = time.time()
+    chat_id = update.message.chat_id
+    lines = [f"📋『 *{to_small_caps('MUTED USERS REPORT')}* 』📋\n"]
+
+    local_here = []
+    for (cid, uid), exp in list(local_muted_store.items()):
+        if cid == chat_id:
+            if exp and now > exp:
+                local_muted_store.pop((cid, uid), None)
+                continue
+            rem = f"({int(exp - now)}s left)" if exp else f"({to_small_caps('Permanent')})"
+            local_here.append(f"• `{uid}` {rem}")
+
+    lines.append(f"🔇 *{to_small_caps('Local Muted (Here):')}* `{len(local_here)}`")
+    if local_here:
+        lines.extend(local_here)
+    else:
+        lines.append(f"_{to_small_caps('No local muted users')}_")
+
+    global_list = []
+    for uid, exp in list(global_muted_store.items()):
+        if exp and now > exp:
+            global_muted_store.pop(uid, None)
+            continue
+        rem = f"({int(exp - now)}s left)" if exp else f"({to_small_caps('Permanent')})"
+        global_list.append(f"• `{uid}` {rem}")
+
+    lines.append(f"\n🌐🔇 *{to_small_caps('Global Muted:')}* `{len(global_list)}`")
+    if global_list:
+        lines.extend(global_list)
+    else:
+        lines.append(f"_{to_small_caps('No global muted users')}_")
+
+    save_mutes()
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+@only_admin
+async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lock current group (auto-delete non-admin messages)."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+    chat_id = update.message.chat_id
+    group_locks.add(chat_id)
+    save_locks()
+    await update.message.reply_text(
+        f"🔒 *{to_small_caps('Group Locked!')}* {to_small_caps('Non-admin messages will be auto-deleted.')}",
+        parse_mode="Markdown"
+    )
+
+@only_admin
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unlock current group."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+    chat_id = update.message.chat_id
+    group_locks.discard(chat_id)
+    save_locks()
+    await update.message.reply_text(
+        f"🔓 *{to_small_caps('Group Unlocked!')}* {to_small_caps('Members can chat freely.')}",
+        parse_mode="Markdown"
+    )
+
+@only_admin
+async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Purge last N messages in the group."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+    chat_id = update.message.chat_id
+    count = 20
+    if context.args:
+        try:
+            count = min(100, max(1, int(context.args[0])))
+        except ValueError:
+            pass
+
+    status_msg = await update.message.reply_text(f"🧹 *{to_small_caps('Purging messages...')}*", parse_mode="Markdown")
+    start_msg_id = update.message.message_id
+    deleted = 0
+    for mid in range(start_msg_id, max(1, start_msg_id - count - 10), -1):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+            deleted += 1
+            if deleted >= count:
+                break
+        except Exception:
+            pass
+
+    try:
+        await status_msg.edit_text(f"✅ *{to_small_caps('Purged')}* `{deleted}` *{to_small_caps('messages!')}*", parse_mode="Markdown")
+        await asyncio.sleep(3)
+        await status_msg.delete()
+    except Exception:
+        pass
+
+
+# ==================== OWNER BOT PROFILE MANAGEMENT (ONLY OWNER) ====================
+
+@only_owner
+async def cmd_setbotname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change the display name of all active bots on Telegram (Owner only)."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}setbotname <{to_small_caps('New Bot Name')}>`",
+            parse_mode="Markdown"
+        )
+
+    new_name = " ".join(context.args).strip()[:64]
+    status_msg = await update.message.reply_text(
+        f"⚙️ *{to_small_caps('Updating bot names to')}* `{new_name}` *{to_small_caps('across all bots...')}*",
+        parse_mode="Markdown"
+    )
+
+    success_count = 0
+    fail_count = 0
+    session = await get_http_session()
+
+    for b in bots:
+        token = getattr(b, "token", None)
+        ok = False
+        if token:
+            try:
+                url = f"https://api.telegram.org/bot{token}/setMyName"
+                async with session.post(url, json={"name": new_name}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        ok = True
+            except Exception:
+                pass
+
+        if not ok:
+            try:
+                if hasattr(b, "set_my_name"):
+                    await b.set_my_name(name=new_name)
+                    ok = True
+            except Exception:
+                pass
+
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    bot_config["bot_name"] = new_name
+    save_config(bot_config)
+
+    msg = (
+        f"👑『 *{to_small_caps('BOT NAME UPDATE COMPLETE')}* 』👑\n\n"
+        f"📝 *{to_small_caps('New Name:')}* `{new_name}`\n"
+        f"✅ *{to_small_caps('Successful:')}* `{success_count}`\n"
+        f"❌ *{to_small_caps('Failed:')}* `{fail_count}`\n\n"
+        f"彡━━━━━━━━━━━━━━━━━━━━━彡\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘* ✨"
+    )
+    await status_msg.edit_text(msg, parse_mode="Markdown")
+
+@only_owner
+async def cmd_setbotbio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change the bio / description of all active bots on Telegram (Owner only)."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    if not context.args:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* `{CMD_PREFIX}setbotbio <{to_small_caps('New Bio / About Description')}>`",
+            parse_mode="Markdown"
+        )
+
+    bio_text = " ".join(context.args).strip()
+    status_msg = await update.message.reply_text(
+        f"⚙️ *{to_small_caps('Updating bot bio across all bots...')}*",
+        parse_mode="Markdown"
+    )
+
+    success_count = 0
+    fail_count = 0
+    session = await get_http_session()
+
+    for b in bots:
+        token = getattr(b, "token", None)
+        ok = False
+        if token:
+            try:
+                url_desc = f"https://api.telegram.org/bot{token}/setMyDescription"
+                url_short = f"https://api.telegram.org/bot{token}/setMyShortDescription"
+                async with session.post(url_desc, json={"description": bio_text}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    pass
+                async with session.post(url_short, json={"short_description": bio_text[:120]}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        ok = True
+            except Exception:
+                pass
+
+        if not ok:
+            try:
+                if hasattr(b, "set_my_description"):
+                    await b.set_my_description(description=bio_text)
+                    await b.set_my_short_description(short_description=bio_text[:120])
+                    ok = True
+            except Exception:
+                pass
+
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    bot_config["bot_bio"] = bio_text
+    save_config(bot_config)
+
+    msg = (
+        f"👑『 *{to_small_caps('BOT BIO UPDATE COMPLETE')}* 』👑\n\n"
+        f"📝 *{to_small_caps('New Bio:')}* `{bio_text[:120]}`\n"
+        f"✅ *{to_small_caps('Successful:')}* `{success_count}`\n"
+        f"❌ *{to_small_caps('Failed:')}* `{fail_count}`\n\n"
+        f"彡━━━━━━━━━━━━━━━━━━━━━彡\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘* ✨"
+    )
+    await status_msg.edit_text(msg, parse_mode="Markdown")
+
+@only_owner
+async def cmd_setbotpfp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change the Profile Picture (PFP) of all active bots on Telegram (Owner only)."""
+    if context.bot.id != MAIN_BOT_ID:
+        return
+
+    img_bytes = None
+
+    # Check reply to photo
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
+        photo = update.message.reply_to_message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        img_bytes = buf.getvalue()
+    elif context.args and (context.args[0].startswith("http://") or context.args[0].startswith("https://")):
+        url = context.args[0]
+        try:
+            session = await get_http_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    img_bytes = await resp.read()
+        except Exception as e:
+            return await update.message.reply_text(f"❌ *{to_small_caps('Failed to download image URL:')}* `{e}`", parse_mode="Markdown")
+
+    if not img_bytes:
+        return await update.message.reply_text(
+            f"⚠️ *{to_small_caps('Usage:')}* {to_small_caps('Reply to an image with')} `{CMD_PREFIX}setbotpfp` {to_small_caps('or pass image URL')}:\n"
+            f"`{CMD_PREFIX}setbotpfp https://.../avatar.jpg`",
+            parse_mode="Markdown"
+        )
+
+    status_msg = await update.message.reply_text(
+        f"🖼 *{to_small_caps('Setting bot Profile Picture across all bots...')}*",
+        parse_mode="Markdown"
+    )
+
+    success_count = 0
+    fail_count = 0
+    session = await get_http_session()
+
+    for b in bots:
+        token = getattr(b, "token", None)
+        ok = False
+
+        # 1. Try aiohttp multipart setMyProfilePhoto
+        if token:
+            try:
+                form = aiohttp.FormData()
+                form.add_field("photo", img_bytes, filename="avatar.jpg", content_type="image/jpeg")
+                url = f"https://api.telegram.org/bot{token}/setMyProfilePhoto"
+                async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        ok = True
+            except Exception:
+                pass
+
+        # 2. Try PTB set_my_profile_photo
+        if not ok:
+            try:
+                if hasattr(b, "set_my_profile_photo"):
+                    buf = io.BytesIO(img_bytes)
+                    await b.set_my_profile_photo(photo=InputProfilePhotoStatic(photo=buf))
+                    ok = True
+            except Exception:
+                pass
+
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    msg = (
+        f"👑『 *{to_small_caps('BOT PFP UPDATE COMPLETE')}* 』👑\n\n"
+        f"🖼 *{to_small_caps('Profile Picture Updated')}*\n"
+        f"✅ *{to_small_caps('Successful:')}* `{success_count}`\n"
+        f"❌ *{to_small_caps('Failed:')}* `{fail_count}`\n\n"
+        f"彡━━━━━━━━━━━━━━━━━━━━━彡\n"
+        f"✨ *{to_small_caps('Powered By')} 𝐌ꫀxx𝐘* ✨"
+    )
+    await status_msg.edit_text(msg, parse_mode="Markdown")
+
 @only_sudo
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.bot.id != MAIN_BOT_ID:
@@ -3661,6 +4549,10 @@ async def cmd_m7(u, c): await _send_menu(u, menu_config.get_menu("main"))
 async def cmd_m8(u, c): await _send_menu(u, menu_config.get_menu("fontnc"))
 @only_sudo
 async def cmd_m9(u, c): await _send_menu(u, menu_config.get_menu("fun"))
+@only_sudo
+async def cmd_m10(u, c): await _send_menu(u, menu_config.get_menu("ai"))
+@only_sudo
+async def cmd_m11(u, c): await _send_menu(u, menu_config.get_menu("mute"))
 
 async def _send_menu(update, menu):
     try:
@@ -3810,8 +4702,46 @@ async def handle_prefix_commands(update: Update, context: ContextTypes.DEFAULT_T
         "setvideosstop": cmd_setvideo_stop,
         "setvideoadmin": cmd_setvideo_admin,
         "setvideoutility": cmd_setvideo_utility,
+        "setvideoai": cmd_setvideo_ai,
+        "setvideomute": cmd_setvideo_mute,
         "setvideostatus": cmd_setvideo_status,
         "setvideoover": cmd_setvideo_over,
+
+        # AI Suite (from u.py)
+        "ask": cmd_ask,
+        "ai": cmd_ask,
+        "gpt": cmd_ask,
+        "imagine": cmd_imagine,
+        "aiimage": cmd_imagine,
+        "draw": cmd_imagine,
+        "qrcode": cmd_qrcode,
+        "qr": cmd_qrcode,
+        "translate": cmd_translate,
+        "tr": cmd_translate,
+
+        # Mute & Moderation Suite (Soft-Delete)
+        "mute": cmd_mute,
+        "unmute": cmd_unmute,
+        "gmute": cmd_gmute,
+        "gunmute": cmd_gunmute,
+        "mutelist": cmd_mutelist,
+        "lock": cmd_lock,
+        "unlock": cmd_unlock,
+        "purge": cmd_purge,
+        "delmsg": cmd_purge,
+
+        # Owner Bot Profile Studio (Only Owner)
+        "setbotname": cmd_setbotname,
+        "setname": cmd_setbotname,
+        "botname": cmd_setbotname,
+        "setbotbio": cmd_setbotbio,
+        "setbio": cmd_setbotbio,
+        "setbotdesc": cmd_setbotbio,
+        "botbio": cmd_setbotbio,
+        "setbotpfp": cmd_setbotpfp,
+        "setpfp": cmd_setbotpfp,
+        "botpfp": cmd_setbotpfp,
+
         "start": cmd_start,
         "myid": cmd_myid,
         "id": cmd_myid,
@@ -3828,6 +4758,7 @@ async def handle_prefix_commands(update: Update, context: ContextTypes.DEFAULT_T
         "m1": cmd_m1, "m2": cmd_m2, "m3": cmd_m3,
         "m4": cmd_m4, "m5": cmd_m5, "m6": cmd_m6,
         "m7": cmd_m7, "m8": cmd_m8, "m9": cmd_m9,
+        "m10": cmd_m10, "m11": cmd_m11,
     }
 
     if cmd_name in cmd_map:
@@ -3835,11 +4766,11 @@ async def handle_prefix_commands(update: Update, context: ContextTypes.DEFAULT_T
 
 def build_app(token):
     request = HTTPXRequest(
-        connection_pool_size=500,
-        connect_timeout=5,
-        read_timeout=10,
-        write_timeout=10,
-        pool_timeout=5,
+        connection_pool_size=1000,
+        connect_timeout=5.0,
+        read_timeout=5.0,
+        write_timeout=5.0,
+        pool_timeout=2.0,
         http_version="1.1",
     )
 
